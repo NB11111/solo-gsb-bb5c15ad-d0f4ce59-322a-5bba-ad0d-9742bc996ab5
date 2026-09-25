@@ -7,8 +7,10 @@ from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 Phase = Literal["A", "B", "C"]
+TimeSlot = Literal["morning", "evening"]
 
 _PHASE_ORDER = {"A": 0, "B": 1, "C": 2}
+_SLOT_ORDER = {"morning": 0, "evening": 1}
 
 
 class Capacities(BaseModel):
@@ -331,5 +333,91 @@ class DeviceAdditionPlanResult(BaseModel):
     )
     migrations: list[AdditionMigrationItem] = Field(
         ..., description="改相的原设备清单（按设备编号排序）；无解时为空"
+    )
+    message: str
+
+
+class ShiftDeviceIn(BaseModel):
+    """双时段错峰规划的单台设备。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="设备唯一编号")
+    power: int = Field(..., gt=0, description="设备功率（正整数）")
+    allowed_phases: list[Phase] = Field(
+        ..., min_length=1, description="可接入相位集合，非空，元素取自 A/B/C"
+    )
+    allowed_slots: list[TimeSlot] = Field(
+        ...,
+        min_length=1,
+        description="允许运行时段集合，非空，元素取自 morning（早）/ evening（晚）",
+    )
+
+    @field_validator("allowed_phases")
+    @classmethod
+    def _dedupe_and_order_phases(cls, value: list[str]) -> list[str]:
+        """去重并按 A/B/C 固定顺序排列。"""
+        return sorted(set(value), key=_PHASE_ORDER.__getitem__)
+
+    @field_validator("allowed_slots")
+    @classmethod
+    def _dedupe_and_order_slots(cls, value: list[str]) -> list[str]:
+        """去重并按 早/晚 固定顺序排列。"""
+        return sorted(set(value), key=_SLOT_ORDER.__getitem__)
+
+
+class ShiftPlanRequest(BaseModel):
+    """双时段错峰接入规划请求体（仅预演，不写入历史计算记录）。"""
+
+    capacities: Capacities = Field(..., description="两时段共用的 A/B/C 相容量")
+    devices: list[ShiftDeviceIn] = Field(
+        ..., min_length=1, max_length=8, description="设备列表，1~8 台"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "ShiftPlanRequest":
+        ids = [d.id for d in self.devices]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class ShiftAssignmentItem(BaseModel):
+    """单台设备的错峰安排：恰选一个允许时段与一个允许相位。"""
+
+    device_id: str
+    slot: TimeSlot
+    phase: Phase
+
+
+class ShiftSlotPlan(BaseModel):
+    """单个时段的三相负载情况。"""
+
+    loads: Loads = Field(..., description="该时段 A/B/C 各相负载")
+    total_load: int = Field(..., description="该时段三相负载之和")
+    imbalance: int = Field(..., description="该时段三相负载最大值与最小值之差")
+
+
+class ShiftSlots(BaseModel):
+    """早、晚两个时段的三相负载情况。"""
+
+    morning: ShiftSlotPlan = Field(..., description="早时段三相负载情况")
+    evening: ShiftSlotPlan = Field(..., description="晚时段三相负载情况")
+
+
+class ShiftPlanResult(BaseModel):
+    """双时段错峰接入规划结果（仅预演，不写入历史计算记录）。"""
+
+    capacities: Loads = Field(..., description="两时段共用的各相容量（回显请求输入）")
+    feasible: bool = Field(..., description="是否存在可行错峰接入方案")
+    peak_total_load: Optional[int] = Field(
+        None, description="两时段总负载（三相之和）的较大值（首要优化目标）"
+    )
+    peak_imbalance: Optional[int] = Field(
+        None, description="两时段三相负载差的较大值（次要优化目标）"
+    )
+    slots: Optional[ShiftSlots] = Field(
+        None, description="早、晚两时段各自的三相负载、总负载与负载差；无解时为 null"
+    )
+    assignments: list[ShiftAssignmentItem] = Field(
+        ..., description="设备安排（按设备编号排序）；无解时为空"
     )
     message: str

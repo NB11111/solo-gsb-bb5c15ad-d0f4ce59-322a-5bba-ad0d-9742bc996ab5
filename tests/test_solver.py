@@ -5,16 +5,19 @@ import random
 import unittest
 
 from app.solver import (
+    SLOTS,
     AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
     RobustDevice,
+    ShiftDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
     solve_robust,
+    solve_shift_plan,
     solve_startup_plan,
 )
 
@@ -1466,6 +1469,304 @@ class DeviceAdditionFuzzTest(unittest.TestCase):
         self.assertEqual(result.loads, {"A": 4, "B": 4, "C": 4})
         self.assertEqual(result.imbalance, 0)
         self.assertEqual(result.migrated_count, 2)
+
+
+def brute_force_shift(devices, capacities):
+    """双时段错峰规划的朴素全枚举：返回 (目标键, (时段, 相位) 序列, 各时段负载)。"""
+    ordered = sorted(devices, key=lambda d: d.code)
+    options = [
+        [
+            (slot, phase)
+            for slot in SLOTS
+            if slot in d.allowed_slots
+            for phase in PHASES
+            if phase in d.allowed_phases
+        ]
+        for d in ordered
+    ]
+    best = None
+    for combo in itertools.product(*options):
+        loads = {s: {p: 0 for p in PHASES} for s in SLOTS}
+        ok = True
+        for (slot, phase), device in zip(combo, ordered):
+            loads[slot][phase] += device.power
+            if loads[slot][phase] > capacities[phase]:
+                ok = False
+                break
+        if not ok:
+            continue
+        totals = {s: sum(loads[s].values()) for s in SLOTS}
+        imbalances = {
+            s: max(loads[s].values()) - min(loads[s].values()) for s in SLOTS
+        }
+        # itertools.product 按选项顺序产生组合，天然为 (时段, 相位) 序列
+        # 字典序；同键保留先遇到的组合即字典序最小方案
+        key = (max(totals.values()), max(imbalances.values()))
+        if best is None or key < best[0]:
+            best = (key, combo, {s: dict(loads[s]) for s in SLOTS})
+    return best
+
+
+class ShiftPlanTest(unittest.TestCase):
+    def test_peak_total_then_peak_imbalance(self):
+        # 总功率 57，目标 1 下界 ceil(57/2)=29；D3 只能晚(15)、D4 只能早(12)，
+        # 唯一达到 32 的时段划分：D1 晚、D2 早（早 32 / 晚 25）
+        devices = [
+            ShiftDevice("D1", 10, ("A", "B"), ("morning", "evening")),
+            ShiftDevice("D2", 20, ("A", "B", "C"), ("morning", "evening")),
+            ShiftDevice("D3", 15, ("B", "C"), ("evening",)),
+            ShiftDevice("D4", 12, ("A", "C"), ("morning",)),
+        ]
+        result = solve_shift_plan(devices, {"A": 30, "B": 30, "C": 30})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total_load, 32)
+        # 早时段 D2(20) 与 D4(12) 必分两相，最小差 20；晚时段最小差 15
+        self.assertEqual(result.peak_imbalance, 20)
+        self.assertEqual(
+            result.slot_loads,
+            {
+                "morning": {"A": 20, "B": 0, "C": 12},
+                "evening": {"A": 10, "B": 15, "C": 0},
+            },
+        )
+        # 字典序最小：D1=(晚,A)、D2=(早,A)、D3=(晚,B)、D4=(早,C)
+        # D4 取 (早,A) 会使早 A 相 32 超容量，故取 C
+        self.assertEqual(
+            result.assignment,
+            {
+                "D1": ("evening", "A"),
+                "D2": ("morning", "A"),
+                "D3": ("evening", "B"),
+                "D4": ("morning", "C"),
+            },
+        )
+
+    def test_single_slot_only(self):
+        # 全部设备只允许早时段：晚时段负载恒为 0
+        devices = [
+            ShiftDevice("Z1", 5, PHASES, ("morning",)),
+            ShiftDevice("Z2", 5, PHASES, ("morning",)),
+        ]
+        result = solve_shift_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total_load, 10)
+        self.assertEqual(result.peak_imbalance, 5)
+        self.assertEqual(
+            result.slot_loads,
+            {
+                "morning": {"A": 5, "B": 5, "C": 0},
+                "evening": {"A": 0, "B": 0, "C": 0},
+            },
+        )
+        # 字典序最小：Z1->(早,A)、Z2->(早,B)
+        self.assertEqual(
+            result.assignment,
+            {"Z1": ("morning", "A"), "Z2": ("morning", "B")},
+        )
+
+    def test_single_device(self):
+        result = solve_shift_plan(
+            [ShiftDevice("X", 7, ("B",), ("evening",))],
+            {"A": 10, "B": 10, "C": 10},
+        )
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.assignment, {"X": ("evening", "B")})
+        self.assertEqual(
+            result.slot_loads,
+            {
+                "morning": {"A": 0, "B": 0, "C": 0},
+                "evening": {"A": 0, "B": 7, "C": 0},
+            },
+        )
+        self.assertEqual(result.peak_total_load, 7)
+        self.assertEqual(result.peak_imbalance, 7)
+
+    def test_lex_within_budget_may_use_non_minimal_slot_imbalance(self):
+        # 对拍中发现的关键情形：联合峰值由晚时段（13）决定时，早时段可在
+        # 13 的预算内放宽容差，换取 DEV-5 处相位 B < C 的字典序更小方案
+        devices = [
+            ShiftDevice("DEV-0", 8, PHASES, ("morning",)),
+            ShiftDevice("DEV-1", 3, PHASES, ("evening",)),
+            ShiftDevice("DEV-2", 12, ("B", "C"), ("morning", "evening")),
+            ShiftDevice("DEV-3", 16, ("A",), ("evening",)),
+            ShiftDevice("DEV-4", 4, ("B",), ("morning",)),
+            ShiftDevice("DEV-5", 10, ("B", "C"), ("morning", "evening")),
+            ShiftDevice("DEV-6", 8, PHASES, ("morning", "evening")),
+        ]
+        caps = {"A": 58, "B": 30, "C": 14}
+        result = solve_shift_plan(devices, caps)
+        expected = brute_force_shift(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            (result.peak_total_load, result.peak_imbalance), expected[0]
+        )
+        ordered = sorted(devices, key=lambda d: d.code)
+        self.assertEqual(
+            tuple(result.assignment[d.code] for d in ordered), expected[1]
+        )
+        self.assertEqual(result.slot_loads, expected[2])
+        # 早时段负载差为 6（非子集最小值 4），但序列在 DEV-5 处更小
+        self.assertEqual(result.slot_loads["morning"], {"A": 8, "B": 14, "C": 8})
+
+    def test_slot_lexicographic_morning_before_evening(self):
+        # 两台完全对称的自由设备：镜像时段划分同键，应取时段序列字典序最小
+        devices = [
+            ShiftDevice("S1", 5, ("A",), ("morning", "evening")),
+            ShiftDevice("S2", 5, ("A",), ("morning", "evening")),
+        ]
+        result = solve_shift_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        # 总负载较大值最小为 5：一台早一台晚；字典序 S1 早、S2 晚
+        self.assertEqual(result.peak_total_load, 5)
+        self.assertEqual(
+            result.assignment,
+            {"S1": ("morning", "A"), "S2": ("evening", "A")},
+        )
+        self.assertEqual(
+            result.slot_loads,
+            {
+                "morning": {"A": 5, "B": 0, "C": 0},
+                "evening": {"A": 5, "B": 0, "C": 0},
+            },
+        )
+
+    def test_infeasible_capacity(self):
+        # 单台设备功率超过两时段任一允许相位容量：无解
+        devices = [
+            ShiftDevice("BIG", 10, ("A", "B", "C"), ("morning", "evening")),
+        ]
+        result = solve_shift_plan(devices, {"A": 5, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.assignment)
+        self.assertIsNone(result.slot_loads)
+        self.assertIsNone(result.peak_total_load)
+        self.assertIsNone(result.peak_imbalance)
+
+    def test_infeasible_forced_slot(self):
+        # 只能晚时段的设备，其允许相位在晚时段容量内放不下：无解
+        devices = [
+            ShiftDevice("F1", 8, ("A",), ("evening",)),
+            ShiftDevice("F2", 3, ("A",), ("morning",)),
+        ]
+        result = solve_shift_plan(devices, {"A": 5, "B": 100, "C": 100})
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.assignment)
+
+    def test_capacity_shared_across_slots(self):
+        # 两时段共用容量：两台只能接 A 的设备功率各 6、容量 A=6，
+        # 分处两时段即可（各时段 A 相负载 6 不超容量）
+        devices = [
+            ShiftDevice("E1", 6, ("A",), ("morning", "evening")),
+            ShiftDevice("E2", 6, ("A",), ("morning", "evening")),
+        ]
+        result = solve_shift_plan(devices, {"A": 6, "B": 0, "C": 0})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total_load, 6)
+        self.assertEqual(result.peak_imbalance, 6)
+        self.assertEqual(result.slot_loads["morning"]["A"], 6)
+        self.assertEqual(result.slot_loads["evening"]["A"], 6)
+
+    def test_device_ids_sorted_as_strings(self):
+        devices = [
+            ShiftDevice("DEV-2", 4, PHASES, SLOTS),
+            ShiftDevice("DEV-10", 4, PHASES, SLOTS),
+            ShiftDevice("DEV-1", 4, PHASES, SLOTS),
+        ]
+        result = solve_shift_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total_load, 8)
+        self.assertEqual(result.peak_imbalance, 4)
+        # 字符串排序 DEV-1 < DEV-10 < DEV-2；字典序最小方案为
+        # DEV-1=(早,A)、DEV-10=(早,B)、DEV-2=(晚,A)（早 8 / 晚 4，差 4）
+        self.assertEqual(
+            result.assignment,
+            {
+                "DEV-1": ("morning", "A"),
+                "DEV-10": ("morning", "B"),
+                "DEV-2": ("evening", "A"),
+            },
+        )
+
+
+class ShiftPlanFuzzTest(unittest.TestCase):
+    """错峰规划求解与朴素全枚举做随机对拍。"""
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260925)
+        for case in range(500):
+            n = rng.randint(1, 7)
+            devices = []
+            for i in range(n):
+                allowed = tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+                slots = tuple(s for s in SLOTS if rng.random() < 0.7) or ("morning",)
+                devices.append(ShiftDevice(f"DEV-{i}", rng.randint(1, 20), allowed, slots))
+            capacities = {p: rng.randint(0, 60) for p in PHASES}
+
+            expected = brute_force_shift(devices, capacities)
+            result = solve_shift_plan(devices, capacities)
+
+            if expected is None:
+                self.assertFalse(result.feasible, f"case {case}: 应为无可行解")
+                continue
+
+            self.assertTrue(result.feasible, f"case {case}: 应有可行解")
+            exp_key, exp_combo, exp_loads = expected
+            self.assertEqual(
+                (result.peak_total_load, result.peak_imbalance),
+                exp_key,
+                f"case {case}: 目标键不符",
+            )
+            self.assertEqual(result.slot_loads, exp_loads, f"case {case}: 负载不符")
+            ordered = sorted(devices, key=lambda d: d.code)
+            actual_combo = tuple(result.assignment[d.code] for d in ordered)
+            self.assertEqual(actual_combo, exp_combo, f"case {case}: 字典序不符")
+            # 一致性校验：安排与允许集合、容量自洽
+            for device, (slot, phase) in zip(ordered, actual_combo):
+                self.assertIn(slot, device.allowed_slots)
+                self.assertIn(phase, device.allowed_phases)
+            for slot in SLOTS:
+                for p in PHASES:
+                    self.assertLessEqual(result.slot_loads[slot][p], capacities[p])
+
+    def test_eight_devices_performance(self):
+        # 8 台设备、时段与相位全允许、大容量：选项空间最大的最坏情形
+        devices = [
+            ShiftDevice(f"D{i:02d}", 2**i, PHASES, SLOTS) for i in range(8)
+        ]
+        caps = {"A": 10**6, "B": 10**6, "C": 10**6}
+        result = solve_shift_plan(devices, caps)
+        expected = brute_force_shift(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            (result.peak_total_load, result.peak_imbalance), expected[0]
+        )
+        ordered = sorted(devices, key=lambda d: d.code)
+        self.assertEqual(
+            tuple(result.assignment[d.code] for d in ordered), expected[1]
+        )
+
+    def test_eight_devices_tight_capacity_performance(self):
+        # 紧容量、受限时段 / 相位的随机 8 台用例（求解器仍应快速完成）
+        rng = random.Random(99)
+        devices = []
+        for i in range(8):
+            allowed = tuple(p for p in PHASES if rng.random() < 0.6) or ("A",)
+            slots = tuple(s for s in SLOTS if rng.random() < 0.6) or ("morning",)
+            devices.append(ShiftDevice(f"DEV-{i}", rng.randint(1, 25), allowed, slots))
+        capacities = {"A": 30, "B": 30, "C": 30}
+        result = solve_shift_plan(devices, capacities)
+        expected = brute_force_shift(devices, capacities)
+        if expected is None:
+            self.assertFalse(result.feasible)
+        else:
+            self.assertTrue(result.feasible)
+            ordered = sorted(devices, key=lambda d: d.code)
+            self.assertEqual(
+                (result.peak_total_load, result.peak_imbalance), expected[0]
+            )
+            self.assertEqual(
+                tuple(result.assignment[d.code] for d in ordered), expected[1]
+            )
 
 
 if __name__ == "__main__":

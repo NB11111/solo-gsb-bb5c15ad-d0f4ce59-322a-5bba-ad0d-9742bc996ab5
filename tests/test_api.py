@@ -1039,3 +1039,198 @@ def test_device_addition_plan_does_not_modify_record():
         ),
     ).json()
     assert again == resp.json()
+
+
+# ---------------------------------------------------------------------------
+# 双时段错峰接入规划
+# ---------------------------------------------------------------------------
+
+# D3 只能晚、D4 只能早；目标 1 最优 32 要求 D1 晚、D2 早；
+# 早时段 D2(20)/D4(12) 必分两相（差 20），晚时段差 15
+SHIFT_PLAN_PAYLOAD = {
+    "capacities": {"A": 30, "B": 30, "C": 30},
+    "devices": [
+        {"id": "D1", "power": 10, "allowed_phases": ["A", "B"],
+         "allowed_slots": ["morning", "evening"]},
+        {"id": "D2", "power": 20, "allowed_phases": ["A", "B", "C"],
+         "allowed_slots": ["morning", "evening"]},
+        {"id": "D3", "power": 15, "allowed_phases": ["B", "C"],
+         "allowed_slots": ["evening"]},
+        {"id": "D4", "power": 12, "allowed_phases": ["A", "C"],
+         "allowed_slots": ["morning"]},
+    ],
+}
+
+
+def test_shift_plan_feasible():
+    resp = client.post("/api/v1/shift-plans", json=SHIFT_PLAN_PAYLOAD)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is True
+    assert body["capacities"] == {"A": 30, "B": 30, "C": 30}
+    assert body["peak_total_load"] == 32
+    assert body["peak_imbalance"] == 20
+    assert body["slots"] == {
+        "morning": {
+            "loads": {"A": 20, "B": 0, "C": 12},
+            "total_load": 32,
+            "imbalance": 20,
+        },
+        "evening": {
+            "loads": {"A": 10, "B": 15, "C": 0},
+            "total_load": 25,
+            "imbalance": 15,
+        },
+    }
+    # 按设备编号排序的 (时段, 相位) 安排
+    assert body["assignments"] == [
+        {"device_id": "D1", "slot": "evening", "phase": "A"},
+        {"device_id": "D2", "slot": "morning", "phase": "A"},
+        {"device_id": "D3", "slot": "evening", "phase": "B"},
+        {"device_id": "D4", "slot": "morning", "phase": "C"},
+    ]
+    assert "预演" in body["message"]
+
+
+def test_shift_plan_infeasible():
+    payload = {
+        "capacities": {"A": 5, "B": 0, "C": 0},
+        "devices": [
+            {"id": "BIG", "power": 10, "allowed_phases": ["A", "B", "C"],
+             "allowed_slots": ["morning", "evening"]},
+        ],
+    }
+    resp = client.post("/api/v1/shift-plans", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["feasible"] is False
+    assert body["peak_total_load"] is None
+    assert body["peak_imbalance"] is None
+    assert body["slots"] is None
+    assert body["assignments"] == []
+    assert "无可行" in body["message"]
+
+
+def test_shift_plan_shared_capacity_across_slots():
+    # 两时段共用容量：两台只能接 A 的设备功率各 6、A 相容量 6，
+    # 分处两时段即各时段 A 相负载均不超容量
+    payload = {
+        "capacities": {"A": 6, "B": 0, "C": 0},
+        "devices": [
+            {"id": "E1", "power": 6, "allowed_phases": ["A"],
+             "allowed_slots": ["morning", "evening"]},
+            {"id": "E2", "power": 6, "allowed_phases": ["A"],
+             "allowed_slots": ["morning", "evening"]},
+        ],
+    }
+    body = client.post("/api/v1/shift-plans", json=payload).json()
+    assert body["feasible"] is True
+    assert body["peak_total_load"] == 6
+    assert body["slots"]["morning"]["loads"]["A"] == 6
+    assert body["slots"]["evening"]["loads"]["A"] == 6
+    # 字典序最小：E1 早、E2 晚
+    assert body["assignments"] == [
+        {"device_id": "E1", "slot": "morning", "phase": "A"},
+        {"device_id": "E2", "slot": "evening", "phase": "A"},
+    ]
+
+
+def test_shift_plan_does_not_persist():
+    before = len(client.get("/api/v1/calculations").json())
+    resp = client.post("/api/v1/shift-plans", json=SHIFT_PLAN_PAYLOAD)
+    assert resp.status_code == 200
+    after = len(client.get("/api/v1/calculations").json())
+    # 预演接口不写入任何历史计算记录
+    assert after == before
+    assert "id" not in resp.json()
+
+    # 重复预演结果确定且相同（幂等读操作）
+    again = client.post("/api/v1/shift-plans", json=SHIFT_PLAN_PAYLOAD).json()
+    assert again == resp.json()
+
+
+def test_shift_plan_validation_duplicate_ids():
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "power": 5, "allowed_phases": ["A"],
+             "allowed_slots": ["morning"]},
+            {"id": "D1", "power": 5, "allowed_phases": ["B"],
+             "allowed_slots": ["evening"]},
+        ],
+    }
+    assert client.post("/api/v1/shift-plans", json=payload).status_code == 422
+
+
+def test_shift_plan_validation_device_count():
+    # 0 台与 9 台均越界（允许 1~8 台）
+    base = {"capacities": {"A": 100, "B": 100, "C": 100}}
+    assert client.post(
+        "/api/v1/shift-plans", json={**base, "devices": []}
+    ).status_code == 422
+    too_many = {
+        **base,
+        "devices": [
+            {"id": f"D{i}", "power": 1, "allowed_phases": ["A"],
+             "allowed_slots": ["morning"]}
+            for i in range(9)
+        ],
+    }
+    assert client.post("/api/v1/shift-plans", json=too_many).status_code == 422
+    # 8 台为上限，允许
+    exactly_eight = {
+        **base,
+        "devices": [
+            {"id": f"D{i}", "power": 1, "allowed_phases": ["A"],
+             "allowed_slots": ["morning"]}
+            for i in range(8)
+        ],
+    }
+    resp = client.post("/api/v1/shift-plans", json=exactly_eight)
+    assert resp.status_code == 200
+    assert resp.json()["feasible"] is True
+
+
+def test_shift_plan_validation_bad_device_fields():
+    base_device = {
+        "id": "D1",
+        "power": 5,
+        "allowed_phases": ["A"],
+        "allowed_slots": ["morning"],
+    }
+    caps = {"A": 10, "B": 10, "C": 10}
+
+    def post(device):
+        return client.post(
+            "/api/v1/shift-plans",
+            json={"capacities": caps, "devices": [device]},
+        )
+
+    # 功率非正整数
+    assert post({**base_device, "power": 0}).status_code == 422
+    # 允许相位为空 / 非法相位
+    assert post({**base_device, "allowed_phases": []}).status_code == 422
+    assert post({**base_device, "allowed_phases": ["X"]}).status_code == 422
+    # 允许时段为空 / 非法时段
+    assert post({**base_device, "allowed_slots": []}).status_code == 422
+    assert post({**base_device, "allowed_slots": ["noon"]}).status_code == 422
+    # 容量为负
+    resp = client.post(
+        "/api/v1/shift-plans",
+        json={"capacities": {"A": -1, "B": 10, "C": 10},
+              "devices": [base_device]},
+    )
+    assert resp.status_code == 422
+
+
+def test_shift_plan_allowed_values_deduplicated():
+    payload = {
+        "capacities": {"A": 10, "B": 10, "C": 10},
+        "devices": [
+            {"id": "D1", "power": 5, "allowed_phases": ["C", "A", "C"],
+             "allowed_slots": ["evening", "morning", "evening"]},
+        ],
+    }
+    resp = client.post("/api/v1/shift-plans", json=payload)
+    assert resp.status_code == 200
+    assert resp.json()["feasible"] is True

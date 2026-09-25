@@ -63,6 +63,26 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 仅严格更优才更新，同键时先枚举到的方案字典序最小。剪枝：容量约束；改相
 台数超过当前最优即剪（改相台数只增不减）；改相台数持平最优时沿用 solve 的
 负载差下界剪枝（此时改相台数与负载差均不可能再严格更优）。
+
+双时段错峰接入规划（solve_shift_plan）：每台设备恰选一个允许运行时段
+（早 morning / 晚 evening）与一个允许相位，两时段共用同一组 A/B/C 相容量，
+各时段各相负载均不得超容量。目标依次为：1) 两时段总负载（三相之和）的
+较大值最小；2) 两时段「三相负载最大值与最小值之差」的较大值最小；
+3) 按设备编号排序的 (时段, 相位) 序列字典序最小（早＜晚，A＜B＜C）。
+
+求解利用时段与相位的可分解结构：时段分配确定后，两时段的相位分配互不影响
+（容量约束按时段逐相独立），故先对全部 2^n 个子集分别求解「该子集作为单一
+时段设备集合」的相位子问题（与 solve 同构的 DFS，求最小三相负载差；全部
+子集的总枚举量为 4^n，n≤8 时仅 65536）；随后按时段序列字典序枚举全部
+时段分配（2^n 个掩码，设备须允许对应时段且两时段的相位子问题均可行），
+以 (总负载较大值, 负载差较大值) 为目标键、仅严格更优才更新，同键时先
+枚举到的时段序列字典序最小。最优时段分配确定后，以最优负载差峰值为各时段
+预算，对两时段设备子集分别做「预算内字典序最小」的相位 DFS（相位按 A→B→C
+展开，首个满足预算的完整方案即字典序最小）——注意不能简单取各时段最小
+负载差的方案：联合目标只要求两时段负载差不超过最优峰值，某时段在预算内
+放宽容差可换取字典序更小的相位选择。两时段各自最优的相位子序列交错合并
+即 (时段, 相位) 联合序列的字典序最小者：联合序列逐位比较时首个差异位置
+必属某一时段，由该时段子序列的字典序最小性保证不被其他同键方案超越。
 """
 
 from __future__ import annotations
@@ -1041,4 +1061,234 @@ def solve_device_addition(
         loads=final_loads,
         imbalance=best_imbalance,
         migrated_count=len(migrations),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双时段错峰接入规划
+# ---------------------------------------------------------------------------
+
+SLOTS: tuple[str, str] = ("morning", "evening")  # 早、晚
+
+
+@dataclass(frozen=True)
+class ShiftDevice:
+    """双时段错峰接入规划的设备。"""
+
+    code: str  # 设备唯一编号
+    power: int  # 正整数功率
+    allowed_phases: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+    allowed_slots: tuple[str, ...]  # 允许运行时段集合（SLOTS 的非空子集）
+
+
+@dataclass(frozen=True)
+class ShiftResult:
+    """双时段错峰接入规划结果。feasible 为 False 时其余字段为 None。
+
+    slot_loads：时段 -> 相位 -> 负载；peak_total_load：两时段总负载
+    （三相之和）的较大值；peak_imbalance：两时段「三相负载最大值与
+    最小值之差」的较大值。
+    """
+
+    feasible: bool
+    assignment: Optional[dict[str, tuple[str, str]]]  # 设备编号 -> (时段, 相位)
+    slot_loads: Optional[dict[str, dict[str, int]]]  # 时段 -> 相位 -> 负载
+    peak_total_load: Optional[int]  # 两时段总负载的较大值
+    peak_imbalance: Optional[int]  # 两时段三相负载差的较大值
+
+
+def solve_shift_plan(
+    devices: Iterable[ShiftDevice], capacities: dict[str, int]
+) -> ShiftResult:
+    """求解双时段错峰接入规划。
+
+    每台设备恰选一个允许时段（早/晚）与一个允许相位；两时段共用同一组
+    A/B/C 相容量，各时段各相负载均不得超容量。目标依次为：
+    1) 两时段总负载（三相之和）的较大值最小；
+    2) 两时段三相负载差（最大值与最小值之差）的较大值最小；
+    3) 按设备编号排序的 (时段, 相位) 序列字典序最小（早＜晚，A＜B＜C）。
+
+    求解结构（详见模块 docstring）：时段分配确定后两时段的相位分配互相
+    独立，故先对全部 2^n 个子集分别求解单时段相位子问题（与 solve 同构），
+    再按时段序列字典序枚举时段分配并取目标键最优者。
+
+    :param devices: 设备集合（编号唯一、功率正整数、允许时段与相位非空）。
+    :param capacities: 两时段共用的各相容量，形如 {"A": int, "B": int, "C": int}。
+    :return: ShiftResult；无可行方案时 feasible=False。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    powers = [d.power for d in ordered]
+    # 每台设备的允许相位 / 时段按 A→B→C、早→晚固定顺序排列
+    allowed = [tuple(p for p in PHASES if p in d.allowed_phases) for d in ordered]
+    slots_of = [tuple(s for s in SLOTS if s in d.allowed_slots) for d in ordered]
+    caps = {p: capacities[p] for p in PHASES}
+
+    size = 1 << n
+
+    # subset_total[mask]：子集内设备的功率和
+    subset_total = [0] * size
+    for mask in range(1, size):
+        lsb = mask & (-mask)
+        i = lsb.bit_length() - 1
+        subset_total[mask] = subset_total[mask ^ lsb] + powers[i]
+
+    # 逐子集求解相位子问题：该子集设备在同一时段内、各相不超容量下的
+    # 最小三相负载差（结构与 solve 相同，仅需求可行性与最小差值）
+    sub_feasible = [False] * size
+    sub_imbalance = [0] * size
+    sub_feasible[0] = True
+    for mask in range(1, size):
+        idxs = [i for i in range(n) if mask & (1 << i)]
+        m = len(idxs)
+        sub_powers = [powers[i] for i in idxs]
+        sub_allowed = [allowed[i] for i in idxs]
+
+        # suffix_addable[k][p]：子集第 k..m-1 台设备中可接入相位 p 的功率和
+        suffix_addable = [{p: 0 for p in PHASES} for _ in range(m + 1)]
+        # suffix_remaining[k]：子集第 k..m-1 台设备的功率总和
+        suffix_remaining = [0] * (m + 1)
+        for k in range(m - 1, -1, -1):
+            for p in PHASES:
+                suffix_addable[k][p] = suffix_addable[k + 1][p] + (
+                    sub_powers[k] if p in sub_allowed[k] else 0
+                )
+            suffix_remaining[k] = suffix_remaining[k + 1] + sub_powers[k]
+
+        loads = {p: 0 for p in PHASES}
+        best_imb: Optional[int] = None
+
+        def dfs(k: int, used: int) -> None:
+            nonlocal best_imb
+            if best_imb == 0:
+                return  # 已达成理论最优（差值为 0），无需继续搜索
+            if k == m:
+                values = loads.values()
+                imbalance = max(values) - min(values)
+                if best_imb is None or imbalance < best_imb:
+                    best_imb = imbalance
+                return
+            if best_imb is not None:
+                # 与 solve 相同的负载差下界剪枝
+                remaining = suffix_remaining[k]
+                lb_max = max(max(loads.values()), ceil((used + remaining) / 3))
+                ub_min = min(loads[p] + suffix_addable[k][p] for p in PHASES)
+                if lb_max - ub_min >= best_imb:
+                    return
+            for phase in sub_allowed[k]:
+                if loads[phase] + sub_powers[k] <= caps[phase]:
+                    loads[phase] += sub_powers[k]
+                    dfs(k + 1, used + sub_powers[k])
+                    loads[phase] -= sub_powers[k]
+
+        dfs(0, 0)
+        if best_imb is not None:
+            sub_feasible[mask] = True
+            sub_imbalance[mask] = best_imb
+
+    # 按时段序列字典序枚举时段分配：bit (n-1-i) 为 1 表示第 i 台设备排入
+    # 晚时段（早=0 < 晚=1），掩码递增即时段序列字典序；目标键严格更优才更新，
+    # 同键时先枚举到的时段序列字典序最小
+    best_key: Optional[tuple[int, int]] = None
+    best_masks: Optional[tuple[int, int]] = None  # (早时段子集, 晚时段子集)
+    for slot_mask in range(size):
+        morning_mask = 0
+        evening_mask = 0
+        for i in range(n):
+            if slot_mask & (1 << (n - 1 - i)):
+                if "evening" not in slots_of[i]:
+                    break
+                evening_mask |= 1 << i
+            else:
+                if "morning" not in slots_of[i]:
+                    break
+                morning_mask |= 1 << i
+        else:
+            if not (sub_feasible[morning_mask] and sub_feasible[evening_mask]):
+                continue
+            key = (
+                max(subset_total[morning_mask], subset_total[evening_mask]),
+                max(sub_imbalance[morning_mask], sub_imbalance[evening_mask]),
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_masks = (morning_mask, evening_mask)
+
+    if best_masks is None:
+        return ShiftResult(
+            feasible=False,
+            assignment=None,
+            slot_loads=None,
+            peak_total_load=None,
+            peak_imbalance=None,
+        )
+
+    # 最优时段分配下重构相位方案。注意不能简单取各时段「最小负载差」的
+    # 字典序最小方案：联合目标只要求两时段负载差不超过最优峰值 best_key[1]，
+    # 某时段在预算内可放宽容差以换取字典序更小的相位选择。故以 best_key[1]
+    # 为各时段负载差预算，相位按 A→B→C 展开做 DFS，首个满足预算的完整方案
+    # 即该时段字典序最小方案；两时段各自最优的交错合并即联合序列字典序最小。
+    budget = best_key[1]
+
+    def lex_first_phases(mask: int) -> tuple[str, ...]:
+        """子集 mask 的设备在负载差不超 budget 下字典序最小的相位方案。"""
+        idxs = [i for i in range(n) if mask & (1 << i)]
+        m = len(idxs)
+        sub_powers = [powers[i] for i in idxs]
+        sub_allowed = [allowed[i] for i in idxs]
+        suffix_addable = [{p: 0 for p in PHASES} for _ in range(m + 1)]
+        suffix_remaining = [0] * (m + 1)
+        for k in range(m - 1, -1, -1):
+            for p in PHASES:
+                suffix_addable[k][p] = suffix_addable[k + 1][p] + (
+                    sub_powers[k] if p in sub_allowed[k] else 0
+                )
+            suffix_remaining[k] = suffix_remaining[k + 1] + sub_powers[k]
+
+        loads = {p: 0 for p in PHASES}
+        current: list[Optional[str]] = [None] * m
+        found: Optional[tuple[str, ...]] = None
+
+        def dfs(k: int, used: int) -> None:
+            nonlocal found
+            if found is not None:
+                return
+            if k == m:
+                values = loads.values()
+                if max(values) - min(values) <= budget:
+                    found = tuple(current)
+                return
+            # 负载差下界超过预算即剪枝（与 solve 相同的下界）
+            remaining = suffix_remaining[k]
+            lb_max = max(max(loads.values()), ceil((used + remaining) / 3))
+            ub_min = min(loads[p] + suffix_addable[k][p] for p in PHASES)
+            if lb_max - ub_min > budget:
+                return
+            for phase in sub_allowed[k]:
+                if loads[phase] + sub_powers[k] <= caps[phase]:
+                    loads[phase] += sub_powers[k]
+                    current[k] = phase
+                    dfs(k + 1, used + sub_powers[k])
+                    loads[phase] -= sub_powers[k]
+                    current[k] = None
+
+        dfs(0, 0)
+        assert found is not None  # 子集最小负载差不超预算，必有满足预算的方案
+        return found
+
+    assignment: dict[str, tuple[str, str]] = {}
+    slot_loads = {s: {p: 0 for p in PHASES} for s in SLOTS}
+    for slot, mask in zip(SLOTS, best_masks):
+        idxs = [i for i in range(n) if mask & (1 << i)]
+        for i, phase in zip(idxs, lex_first_phases(mask)):
+            assignment[ordered[i].code] = (slot, phase)
+            slot_loads[slot][phase] += powers[i]
+    return ShiftResult(
+        feasible=True,
+        assignment=assignment,
+        slot_loads=slot_loads,
+        peak_total_load=max(sum(slot_loads[s].values()) for s in SLOTS),
+        peak_imbalance=max(
+            max(slot_loads[s].values()) - min(slot_loads[s].values()) for s in SLOTS
+        ),
     )
