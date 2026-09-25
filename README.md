@@ -34,6 +34,13 @@
 依次为**原设备改相台数最少**、**三相负载最大值与最小值之差最小**、按全部设备
 编号排序的相位序列**字典序最小**。预演同样**不修改历史记录**。
 
+此外，服务还提供**双时段错峰接入预演**接口：提交 **1～8 台设备**的唯一编号、
+正整数功率、**允许相位**与**允许运行时段（早 / 晚）**，以及两时段共用的
+A/B/C 各相容量；每台设备恰选一个允许时段和一个允许相位，**早、晚两时段各相
+负载均不得超容量**。优化目标依次为**两时段总负载的较大值最小**、**两时段三相
+负载差的较大值最小**，同值时取按设备编号排序后的（时段、相位）序列**字典序
+最小**（早＜晚，A＜B＜C）。预演同样**不写入历史计算记录**。
+
 ## 快速开始（一键启动）
 
 前置条件：已安装 Docker 与 Docker Compose 插件。
@@ -75,6 +82,7 @@ docker compose up --build
 | `POST` | `/api/v1/calculations/{id}/phase-fault-rehearsal` | 为「有可行分配」的记录预演单相故障下的保供迁移 / 断开方案（原记录不变） |
 | `POST` | `/api/v1/calculations/{id}/device-addition-plan` | 为「有可行分配」的记录预演新增设备接入方案（原设备改相最少，原记录不变） |
 | `POST` | `/api/v1/robust-rehearsals` | 稳健分相预演：设备功率为区间，求任意功率组合下均不超容量的最优分配（不持久化） |
+| `POST` | `/api/v1/shift-plans` | 双时段错峰接入预演：为 1~8 台设备规划早 / 晚时段与 A/B/C 相位（不持久化） |
 | `GET` | `/health` | 健康检查 |
 
 ### 请求示例
@@ -624,6 +632,114 @@ curl -X POST http://localhost:8000/api/v1/calculations/1/device-addition-plan \
   （自动去重）；
 - 记录不存在返回 `404`；原记录 `feasible=false` 返回 `409`。
 
+## 双时段错峰接入预演
+
+`POST /api/v1/shift-plans` 用于需要在**早、晚两个运行时段**之间错峰安排设备
+接入的事前推演。请求提交 **1～8 台设备**，每台设备给出：
+
+- 唯一编号 `id`、正整数功率 `power`；
+- 允许接入相位 `allowed_phases`（非空，元素取自 `A` / `B` / `C`，自动去重）；
+- 允许运行时段 `allowed_shifts`（非空，元素取自 `morning`（早）/ `evening`（晚），
+  自动去重）。
+
+另有两时段**共用**的一组 A/B/C 容量 `capacities`（非负整数）。每台设备
+**恰选一个允许时段和一个允许相位**；早、晚两时段各自的 A/B/C 三相负载均
+**不得超过容量**。优化目标依次为：
+
+1. **最小化两时段总负载（该时段三相负载之和）的较大值**（`peak_total`，
+   即「削峰」）；
+2. 同值时，**最小化两时段「三相负载最大值与最小值之差」的较大值**
+   （`peak_imbalance`）；
+3. 仍同值时，取按**设备编号排序**后的（时段、相位）序列**字典序最小**者，
+   单项次序为 **早（`morning`）＜晚（`evening`）**、**A＜B＜C**。
+
+接口**只做预演，不写入历史计算记录**；不存在满足全部约束的安排时返回
+`feasible: false` 及说明信息。字段不满足校验规则时返回 `422`。
+
+### 请求示例
+
+```bash
+curl -X POST http://localhost:8000/api/v1/shift-plans \
+  -H "Content-Type: application/json" \
+  -d '{
+    "capacities": {"A": 30, "B": 30, "C": 30},
+    "devices": [
+      {"id": "D1", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]},
+      {"id": "D2", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]},
+      {"id": "D3", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]},
+      {"id": "D4", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]},
+      {"id": "D5", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]},
+      {"id": "D6", "power": 4, "allowed_phases": ["A", "B", "C"], "allowed_shifts": ["morning", "evening"]}
+    ]
+  }'
+```
+
+### 响应示例（存在可行安排）
+
+6 台功率均为 4 的设备、两时段各相容量 30：总功率 24，两时段各安排 3 台时
+峰值总负载最小（12）；每个时段三台分接 A/B/C，三相完全均衡（负载差 0）；
+序列字典序最小安排为 D1～D3 在早时段依次接 A/B/C，D4～D6 在晚时段依次接
+A/B/C：
+
+```json
+{
+  "capacities": {"A": 30, "B": 30, "C": 30},
+  "feasible": true,
+  "peak_total": 12,
+  "peak_imbalance": 0,
+  "loads": {
+    "morning": {"A": 4, "B": 4, "C": 4},
+    "evening": {"A": 4, "B": 4, "C": 4}
+  },
+  "assignments": [
+    {"device_id": "D1", "shift": "morning", "phase": "A"},
+    {"device_id": "D2", "shift": "morning", "phase": "B"},
+    {"device_id": "D3", "shift": "morning", "phase": "C"},
+    {"device_id": "D4", "shift": "evening", "phase": "A"},
+    {"device_id": "D5", "shift": "evening", "phase": "B"},
+    {"device_id": "D6", "shift": "evening", "phase": "C"}
+  ],
+  "message": "预演成功：已在最小化两时段总负载较大值、再最小化两时段三相负载差较大值的目标下，找到各设备的运行时段与接入相位安排"
+}
+```
+
+### 响应示例（无可行安排）
+
+唯一设备功率 9，但任一相位容量均为 3，无论放在哪个时段都超容量：
+
+```json
+{
+  "capacities": {"A": 3, "B": 3, "C": 3},
+  "feasible": false,
+  "peak_total": null,
+  "peak_imbalance": null,
+  "loads": null,
+  "assignments": [],
+  "message": "无可行安排：不存在每台设备均选择允许时段与允许相位、且两时段各相负载均不超容量的方案"
+}
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| --- | --- |
+| `capacities` | 早 / 晚两时段共用的各相容量（回显请求输入） |
+| `feasible` | 是否存在满足全部约束的时段 + 相位安排 |
+| `peak_total` | 两时段三相总负载的较大值（首要优化目标） |
+| `peak_imbalance` | 两时段「三相负载最大值 − 最小负载」的较大值（次要优化目标） |
+| `loads.morning` / `loads.evening` | 早 / 晚时段各自的 A/B/C 三相负载（均不超过容量）；无解时 `loads` 为 `null` |
+| `assignments` | 每台设备的运行时段（`shift`）与接入相位（`phase`），按设备编号排序；无解时为空数组 |
+
+### 输入校验规则
+
+- 设备数量 **1 ~ 8** 台，设备编号**唯一**且非空；
+- `power` 为**正整数**；
+- `allowed_phases` 为**非空**数组，元素取自 `A` / `B` / `C`（自动去重）；
+- `allowed_shifts` 为**非空**数组，元素取自 `morning` / `evening`（自动去重）；
+- 各相容量为**非负整数**。
+
+不满足规则时返回 `422` 及具体错误信息。
+
 ## 本地开发
 
 ```bash
@@ -701,3 +817,13 @@ DFS：健康相设备保持原分配，其负载预先计入健康相；每台�
 字典序最小。剪枝包括容量约束、「改相台数超过当前最优」剪枝（改相台数只增不减），
 以及改相台数持平最优时沿用主求解器的负载差下界剪枝（此时改相台数与负载差均
 不可能再严格更优）。新旧合计不超过 12 台，最坏情形亦可快速完成。
+
+**双时段错峰接入预演**（`shift-plans`）将设备按编号排序后做 DFS，每台设备的
+选项为允许的（时段, 相位）组合，按 **时段早→晚、相位 A→B→C** 展开，完整方案
+天然按「设备编号排序后的（时段、相位）序列」字典序（早＜晚，A＜B＜C）依次产生。
+目标键为 `(两时段总负载的较大值, 两时段三相负载差的较大值)`，仅严格更优才更新，
+同键时先枚举到的方案字典序最小。剪枝包括：逐时段逐相的容量约束；峰值总负载
+乐观下界（总功率平均值上取整，以及当前各时段总负载加只允许该时段的剩余设备
+功率和，下界已无法严格更优即剪）；峰值总负载持平时，再对各时段分别套用主
+求解器的「当前最大负载 −（当前各相负载加剩余可接入功率和的最小值）」负载差
+下界剪枝。设备不超过 8 台、每台至多 6 个选项，最坏情形亦可快速完成。

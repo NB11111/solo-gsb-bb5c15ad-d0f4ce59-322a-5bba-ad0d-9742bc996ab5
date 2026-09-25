@@ -63,6 +63,18 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 仅严格更优才更新，同键时先枚举到的方案字典序最小。剪枝：容量约束；改相
 台数超过当前最优即剪（改相台数只增不减）；改相台数持平最优时沿用 solve 的
 负载差下界剪枝（此时改相台数与负载差均不可能再严格更优）。
+
+双时段错峰接入预演（solve_shift_plan）：每台设备给定允许相位与允许运行时段
+（早 / 晚，两时段共用同一组 A/B/C 容量），恰选一个允许时段与一个允许相位；
+各时段各相负载均不得超容量。目标依次为：1) 两时段总负载的较大值最小
+（总功率恒定，理论下界为总功率 / 2 上取整，受时段限制与容量约束可能抬高）；
+2) 两时段「三相负载最大值与最小值之差」的较大值最小；3) 仍同值时取按设备
+编号排序后的（时段, 相位）序列字典序最小者（早＜晚，A＜B＜C）。设备至多
+8 台、每台至多 6 个（时段, 相位）选项，按编号排序 DFS，选项按时段早→晚、
+相位 A→B→C 展开，完整方案按序列字典序依次产生，目标键 (峰值总负载, 峰值
+负载差) 仅严格更优才更新，同键自然保留字典序最小方案。剪枝：容量约束；
+峰值总负载下界（当前各时段总负载 + 只允许该时段的剩余设备功率和，以及
+总功率平均下界）；峰值已无法严格更优时再用各时段负载差下界剪枝。
 """
 
 from __future__ import annotations
@@ -1041,4 +1053,184 @@ def solve_device_addition(
         loads=final_loads,
         imbalance=best_imbalance,
         migrated_count=len(migrations),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双时段错峰接入预演
+# ---------------------------------------------------------------------------
+
+# 运行时段固定顺序（早＜晚，同时作为 DFS 展开顺序与字典序）
+SHIFTS: tuple[str, str] = ("morning", "evening")
+
+
+@dataclass(frozen=True)
+class ShiftDevice:
+    """双时段错峰接入设备。"""
+
+    code: str  # 设备唯一编号
+    power: int  # 正整数功率
+    allowed_phases: tuple[str, ...]  # 可接入相位集合（PHASES 的非空子集）
+    allowed_shifts: tuple[str, ...]  # 可运行时段集合（SHIFTS 的非空子集）
+
+
+@dataclass(frozen=True)
+class ShiftPlanResult:
+    """双时段错峰接入预演结果。feasible 为 False 时其余字段为 None。"""
+
+    feasible: bool
+    assignment: Optional[dict[str, tuple[str, str]]]  # 设备编号 -> (时段, 相位)
+    loads: Optional[dict[str, dict[str, int]]]  # 时段 -> (相位 -> 负载)
+    totals: Optional[dict[str, int]]  # 时段 -> 该时段三相总负载
+    peak_total: Optional[int]  # 两时段总负载的较大值
+    imbalances: Optional[dict[str, int]]  # 时段 -> 该时段三相负载差
+    peak_imbalance: Optional[int]  # 两时段三相负载差的较大值
+
+
+def solve_shift_plan(
+    devices: Iterable[ShiftDevice], capacities: dict[str, int]
+) -> ShiftPlanResult:
+    """求解双时段错峰接入预演。
+
+    每台设备恰选一个允许时段与一个允许相位；各时段各相负载均不得超容量。
+    目标依次为：1) 两时段总负载的较大值（峰值总负载）最小；2) 两时段三相
+    负载差的较大值（峰值负载差）最小；3) 按设备编号排序后的（时段, 相位）
+    序列字典序最小（早＜晚，A＜B＜C）。
+
+    求解结构（详见模块 docstring）：设备按编号排序后 DFS，每个设备的选项为
+    允许的（时段, 相位）组合，按时段早→晚、相位 A→B→C 展开，完整方案按
+    序列字典序依次产生；目标键 (峰值总负载, 峰值负载差) 仅严格更优才更新，
+    同键时先枚举到的方案字典序最小。
+
+    :param devices: 设备集合（编号唯一、功率正整数、允许相位与允许时段非空）。
+    :param capacities: 两时段共用的各相容量，形如 {"A": int, "B": int, "C": int}。
+    :return: ShiftPlanResult；无可行方案时 feasible=False。
+    """
+    ordered = sorted(devices, key=lambda d: d.code)
+    n = len(ordered)
+    powers = [d.power for d in ordered]
+    caps = {p: capacities[p] for p in PHASES}
+    # 每个设备的（时段, 相位）选项按 时段早→晚、相位 A→B→C 固定顺序排列，
+    # 保证 DFS 按序列字典序枚举方案
+    options: list[list[tuple[str, str]]] = [
+        [
+            (shift, phase)
+            for shift in SHIFTS
+            if shift in d.allowed_shifts
+            for phase in PHASES
+            if phase in d.allowed_phases
+        ]
+        for d in ordered
+    ]
+
+    # suffix_addable[i][s][p]：第 i..n-1 台设备中可接入「时段 s、相位 p」的
+    # 设备功率和（负载差下界剪枝用）
+    suffix_addable = [
+        {s: {p: 0 for p in PHASES} for s in SHIFTS} for _ in range(n + 1)
+    ]
+    # suffix_shift[i][s]：第 i..n-1 台设备中只允许时段 s 的设备功率和
+    # （峰值总负载下界剪枝用）
+    suffix_shift = [{s: 0 for s in SHIFTS} for _ in range(n + 1)]
+    suffix_total = [0] * (n + 1)  # 第 i..n-1 台设备的功率总和
+    for i in range(n - 1, -1, -1):
+        prev_add, cur_add = suffix_addable[i + 1], suffix_addable[i]
+        prev_shift, cur_shift = suffix_shift[i + 1], suffix_shift[i]
+        for s in SHIFTS:
+            for p in PHASES:
+                cur_add[s][p] = prev_add[s][p] + (
+                    powers[i]
+                    if s in ordered[i].allowed_shifts and p in ordered[i].allowed_phases
+                    else 0
+                )
+            if ordered[i].allowed_shifts == (s,):
+                cur_shift[s] = prev_shift[s] + powers[i]
+            else:
+                cur_shift[s] = prev_shift[s]
+        suffix_total[i] = suffix_total[i + 1] + powers[i]
+
+    # loads[s][p]：当前部分分配下时段 s 相位 p 的负载；totals[s] 为该时段总负载
+    loads = {s: {p: 0 for p in PHASES} for s in SHIFTS}
+    totals = {s: 0 for s in SHIFTS}
+    current: list[Optional[tuple[str, str]]] = [None] * n
+    best_peak: Optional[int] = None
+    best_imb: Optional[int] = None
+    best_assignment: Optional[list[tuple[str, str]]] = None
+
+    def dfs(i: int) -> None:
+        nonlocal best_peak, best_imb, best_assignment
+        if i == n:
+            peak = max(totals.values())
+            imb = max(
+                max(loads[s].values()) - min(loads[s].values()) for s in SHIFTS
+            )
+            # 目标键 (峰值总负载, 峰值负载差) 仅严格更优才更新：
+            # 同键时先枚举到的方案（时段, 相位）序列字典序更小
+            if best_peak is None or (peak, imb) < (best_peak, best_imb):
+                best_peak, best_imb = peak, imb
+                best_assignment = current.copy()
+            return
+        remaining = suffix_total[i]
+        total_power = totals["morning"] + totals["evening"] + remaining
+        # 峰值总负载的乐观下界：
+        #   总功率平均值上取整；当前各时段总负载 + 只允许该时段的剩余设备功率和
+        lb_peak = max(
+            ceil(total_power / 2),
+            totals["morning"] + suffix_shift[i]["morning"],
+            totals["evening"] + suffix_shift[i]["evening"],
+        )
+        if best_peak is not None and lb_peak > best_peak:
+            return
+        if best_peak is not None and lb_peak == best_peak:
+            # 峰值总负载已无法严格更优，子树只可能在峰值负载差严格更小时胜出。
+            # 各时段负载差乐观下界（沿用 solve 的下界结构）：
+            #   最终最大负载 >= 当前最大负载；
+            #   最终最小负载 <= min(当前各相负载 + 剩余可接入该相功率和)。
+            lb_imb = 0
+            for s in SHIFTS:
+                cur_max = max(loads[s].values())
+                ub_min = min(
+                    loads[s][p] + suffix_addable[i][s][p] for p in PHASES
+                )
+                lb_imb = max(lb_imb, cur_max - ub_min)
+            if lb_imb >= best_imb:
+                return
+        for shift, phase in options[i]:
+            if loads[shift][phase] + powers[i] <= caps[phase]:
+                loads[shift][phase] += powers[i]
+                totals[shift] += powers[i]
+                current[i] = (shift, phase)
+                dfs(i + 1)
+                loads[shift][phase] -= powers[i]
+                totals[shift] -= powers[i]
+                current[i] = None
+
+    dfs(0)
+
+    if best_assignment is None:
+        return ShiftPlanResult(
+            feasible=False,
+            assignment=None,
+            loads=None,
+            totals=None,
+            peak_total=None,
+            imbalances=None,
+            peak_imbalance=None,
+        )
+
+    final_loads = {s: {p: 0 for p in PHASES} for s in SHIFTS}
+    for idx, (shift, phase) in enumerate(best_assignment):
+        final_loads[shift][phase] += powers[idx]
+    assignment = {ordered[i].code: best_assignment[i] for i in range(n)}
+    final_totals = {s: sum(final_loads[s].values()) for s in SHIFTS}
+    final_imbalances = {
+        s: max(final_loads[s].values()) - min(final_loads[s].values()) for s in SHIFTS
+    }
+    return ShiftPlanResult(
+        feasible=True,
+        assignment=assignment,
+        loads=final_loads,
+        totals=final_totals,
+        peak_total=max(final_totals.values()),
+        imbalances=final_imbalances,
+        peak_imbalance=max(final_imbalances.values()),
     )

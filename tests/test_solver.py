@@ -9,12 +9,14 @@ from app.solver import (
     Device,
     FaultRehearsalDevice,
     RobustDevice,
+    ShiftDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
     solve_robust,
+    solve_shift_plan,
     solve_startup_plan,
 )
 
@@ -1466,6 +1468,310 @@ class DeviceAdditionFuzzTest(unittest.TestCase):
         self.assertEqual(result.loads, {"A": 4, "B": 4, "C": 4})
         self.assertEqual(result.imbalance, 0)
         self.assertEqual(result.migrated_count, 2)
+
+
+def brute_force_shift(devices, capacities):
+    """双时段错峰接入预演的朴素全枚举参照实现。
+
+    设备按编号排序，每台枚举允许的（时段, 相位）组合（早→晚、A→B→C）。
+    按 (峰值总负载, 峰值负载差, 序列) 取最优，返回
+    (键, 各时段负载, 设备 -> (时段, 相位)) 或 None（无可行方案）。
+    注意字典序为规格约定的 早＜晚、A＜B＜C，不能用英文字符串原生比较
+    （字母序下 evening < morning）。
+    """
+    shift_rank = {"morning": 0, "evening": 1}
+    phase_rank = {"A": 0, "B": 1, "C": 2}
+    ordered = sorted(devices, key=lambda d: d.code)
+    choices = []
+    for d in ordered:
+        choices.append(
+            [
+                (shift, phase)
+                for shift in ("morning", "evening")
+                if shift in d.allowed_shifts
+                for phase in PHASES
+                if phase in d.allowed_phases
+            ]
+        )
+    best = None
+    for combo in itertools.product(*choices):
+        loads = {s: {p: 0 for p in PHASES} for s in ("morning", "evening")}
+        ok = True
+        for d, (shift, phase) in zip(ordered, combo):
+            loads[shift][phase] += d.power
+            if loads[shift][phase] > capacities[phase]:
+                ok = False
+                break
+        if not ok:
+            continue
+        totals = {s: sum(loads[s].values()) for s in ("morning", "evening")}
+        imbalances = {
+            s: max(loads[s].values()) - min(loads[s].values())
+            for s in ("morning", "evening")
+        }
+        ranked = tuple((shift_rank[s], phase_rank[p]) for s, p in combo)
+        key = (
+            max(totals.values()),
+            max(imbalances.values()),
+            ranked,
+        )
+        if best is None or key < best[0]:
+            assignment = {
+                d.code: choice for d, choice in zip(ordered, combo)
+            }
+            best = (key, loads, assignment, combo)
+    return best
+
+
+class ShiftPlanTest(unittest.TestCase):
+    def test_peak_total_balanced_between_shifts(self):
+        # 两台全时段全相位设备功率 4、8：两时段各放一台，峰值总负载为 8
+        devices = [
+            ShiftDevice("D1", 4, PHASES, ("morning", "evening")),
+            ShiftDevice("D2", 8, PHASES, ("morning", "evening")),
+        ]
+        caps = {"A": 100, "B": 100, "C": 100}
+        result = solve_shift_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, 8)
+        # 序列字典序最小：D1 取第一个选项（早, A），D2 必须晚时段取（晚, A）
+        self.assertEqual(
+            result.assignment, {"D1": ("morning", "A"), "D2": ("evening", "A")}
+        )
+        self.assertEqual(
+            result.loads,
+            {
+                "morning": {"A": 4, "B": 0, "C": 0},
+                "evening": {"A": 8, "B": 0, "C": 0},
+            },
+        )
+        self.assertEqual(result.totals, {"morning": 4, "evening": 8})
+        self.assertEqual(result.imbalances, {"morning": 4, "evening": 8})
+        self.assertEqual(result.peak_imbalance, 8)
+
+    def test_single_device(self):
+        devices = [ShiftDevice("D1", 5, ("B", "C"), ("evening",))]
+        result = solve_shift_plan(devices, {"A": 10, "B": 10, "C": 10})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, 5)
+        self.assertEqual(result.assignment, {"D1": ("evening", "B")})
+        self.assertEqual(
+            result.loads,
+            {
+                "morning": {"A": 0, "B": 0, "C": 0},
+                "evening": {"A": 0, "B": 5, "C": 0},
+            },
+        )
+        self.assertEqual(result.peak_imbalance, 5)
+
+    def test_infeasible_capacity(self):
+        # 唯一设备功率 50，任何时段相位都超容量
+        devices = [
+            ShiftDevice("D1", 50, PHASES, ("morning", "evening")),
+        ]
+        result = solve_shift_plan(devices, {"A": 10, "B": 10, "C": 10})
+        self.assertFalse(result.feasible)
+        self.assertIsNone(result.assignment)
+        self.assertIsNone(result.loads)
+        self.assertIsNone(result.peak_total)
+        self.assertIsNone(result.peak_imbalance)
+
+    def test_infeasible_shift_forced(self):
+        # 两台只能早时段运行且只能接 A，A 容量容不下二者之和
+        devices = [
+            ShiftDevice("D1", 6, ("A",), ("morning",)),
+            ShiftDevice("D2", 6, ("A",), ("morning",)),
+        ]
+        result = solve_shift_plan(devices, {"A": 10, "B": 0, "C": 0})
+        self.assertFalse(result.feasible)
+
+    def test_shift_restriction_raises_peak(self):
+        # 两台只能早时段（功率各 4），一台全时段（功率 4）：
+        # 早时段至少 8；平均下界为 6，故峰值总负载为 8
+        devices = [
+            ShiftDevice("D1", 4, PHASES, ("morning",)),
+            ShiftDevice("D2", 4, PHASES, ("morning",)),
+            ShiftDevice("D3", 4, PHASES, ("morning", "evening")),
+        ]
+        caps = {"A": 100, "B": 100, "C": 100}
+        result = solve_shift_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, 8)
+        self.assertEqual(result.totals, {"morning": 8, "evening": 4})
+        # 峰值总负载固定为 8；次要目标下早时段两台分接 A/B（负载差 3），
+        # D3 晚时段接 A（负载差 4），峰值负载差为 4；序列字典序最小
+        self.assertEqual(
+            result.assignment,
+            {
+                "D1": ("morning", "A"),
+                "D2": ("morning", "B"),
+                "D3": ("evening", "A"),
+            },
+        )
+        self.assertEqual(
+            result.loads,
+            {
+                "morning": {"A": 4, "B": 4, "C": 0},
+                "evening": {"A": 4, "B": 0, "C": 0},
+            },
+        )
+        self.assertEqual(result.peak_imbalance, 4)
+
+    def test_peak_imbalance_secondary_objective(self):
+        # 四台功率均为 3、全时段全相位，容量各 30：
+        # 峰值总负载最小为 6（每时段两台）。同相并接时时段负载差为 6，
+        # 分到两个不同相位可得负载差 3；字典序最小安排为
+        # D1（早,A）、D2（早,B）、D3（晚,A）、D4（晚,B）
+        devices = [
+            ShiftDevice(f"D{i}", 3, PHASES, ("morning", "evening"))
+            for i in range(1, 5)
+        ]
+        caps = {"A": 30, "B": 30, "C": 30}
+        result = solve_shift_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, 6)
+        self.assertEqual(result.peak_imbalance, 3)
+        self.assertEqual(
+            result.assignment,
+            {
+                "D1": ("morning", "A"),
+                "D2": ("morning", "B"),
+                "D3": ("evening", "A"),
+                "D4": ("evening", "B"),
+            },
+        )
+        self.assertEqual(
+            result.loads,
+            {
+                "morning": {"A": 3, "B": 3, "C": 0},
+                "evening": {"A": 3, "B": 3, "C": 0},
+            },
+        )
+
+    def test_peak_total_before_imbalance(self):
+        # 两台设备功率 1、7：分属两时段时峰值总负载 7（负载差 7）；
+        # 同放早时段时峰值总负载 8（负载差 6）。首要目标取前者。
+        devices = [
+            ShiftDevice("D1", 1, PHASES, ("morning", "evening")),
+            ShiftDevice("D2", 7, PHASES, ("morning", "evening")),
+        ]
+        caps = {"A": 100, "B": 100, "C": 100}
+        result = solve_shift_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, 7)
+        self.assertEqual(result.peak_imbalance, 7)
+        self.assertEqual(
+            result.assignment, {"D1": ("morning", "A"), "D2": ("evening", "A")}
+        )
+
+    def test_lexicographic_ordering_shift_before_phase(self):
+        # 单台全时段全相位设备：选项顺序早＜晚、A＜B＜C，取（早, A）
+        devices = [ShiftDevice("Z9", 5, ("C", "A"), ("evening", "morning"))]
+        result = solve_shift_plan(devices, {"A": 10, "B": 10, "C": 10})
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.assignment, {"Z9": ("morning", "A")})
+
+    def test_devices_sorted_by_code_for_tie_break(self):
+        # 两台相同设备 B2、A1：按编号排序为 A1、B2，序列字典序最小
+        devices = [
+            ShiftDevice("B2", 5, PHASES, ("morning", "evening")),
+            ShiftDevice("A1", 5, PHASES, ("morning", "evening")),
+        ]
+        result = solve_shift_plan(devices, {"A": 100, "B": 100, "C": 100})
+        self.assertTrue(result.feasible)
+        self.assertEqual(
+            result.assignment,
+            {"A1": ("morning", "A"), "B2": ("evening", "A")},
+        )
+
+
+class ShiftPlanFuzzTest(unittest.TestCase):
+    """与朴素全枚举参照实现做随机对拍。"""
+
+    def _check_against(self, devices, capacities):
+        result = solve_shift_plan(devices, capacities)
+        expected = brute_force_shift(devices, capacities)
+        if expected is None:
+            self.assertFalse(result.feasible)
+            return
+        (exp_peak, exp_imb, _ranked), exp_loads, _assignment, exp_combo = expected
+        self.assertTrue(result.feasible)
+        self.assertEqual(result.peak_total, exp_peak)
+        self.assertEqual(result.peak_imbalance, exp_imb)
+        self.assertEqual(result.loads, exp_loads)
+        ordered = sorted(devices, key=lambda d: d.code)
+        actual_combo = tuple(result.assignment[d.code] for d in ordered)
+        self.assertEqual(actual_combo, exp_combo)
+        # 自洽性：各时段各相不超容量，时段总负载与负载差自洽
+        for s in ("morning", "evening"):
+            for p in PHASES:
+                self.assertLessEqual(result.loads[s][p], capacities[p])
+            self.assertEqual(result.totals[s], sum(result.loads[s].values()))
+            self.assertEqual(
+                result.imbalances[s],
+                max(result.loads[s].values()) - min(result.loads[s].values()),
+            )
+        # 每台设备的时段与相位均在允许集合内
+        for d in devices:
+            shift, phase = result.assignment[d.code]
+            self.assertIn(shift, d.allowed_shifts)
+            self.assertIn(phase, d.allowed_phases)
+
+    def test_against_brute_force(self):
+        rng = random.Random(20261002)
+        for case in range(400):
+            n = rng.randint(1, 7)
+            devices = []
+            for i in range(n):
+                allowed_phases = (
+                    tuple(p for p in PHASES if rng.random() < 0.7) or ("A",)
+                )
+                allowed_shifts = tuple(
+                    s for s in ("morning", "evening") if rng.random() < 0.7
+                ) or ("morning",)
+                devices.append(
+                    ShiftDevice(
+                        f"DEV-{i}",
+                        rng.randint(1, 20),
+                        allowed_phases,
+                        allowed_shifts,
+                    )
+                )
+            capacities = {p: rng.randint(0, 50) for p in PHASES}
+            self._check_against(devices, capacities)
+
+    def test_eight_devices_against_brute_force(self):
+        # 8 台设备、全时段全相位：6^8 ≈ 168 万全枚举，紧容量下大量分支
+        # 被容量约束剪枝，覆盖最大规模下的最优性与字典序
+        rng = random.Random(20261003)
+        devices = [
+            ShiftDevice(
+                f"D{i:02d}",
+                rng.randint(1, 9),
+                PHASES,
+                ("morning", "evening"),
+            )
+            for i in range(8)
+        ]
+        capacities = {"A": 14, "B": 14, "C": 14}
+        self._check_against(devices, capacities)
+
+    def test_eight_devices_performance(self):
+        # 8 台设备、大容量、2 的幂次功率：剪枝较弱的较坏情形，应快速完成
+        devices = [
+            ShiftDevice(f"D{i:02d}", 2**i, PHASES, ("morning", "evening"))
+            for i in range(8)
+        ]
+        caps = {"A": 10**6, "B": 10**6, "C": 10**6}
+        result = solve_shift_plan(devices, caps)
+        self.assertTrue(result.feasible)
+        expected = brute_force_shift(devices, caps)
+        self.assertEqual(result.peak_total, expected[0][0])
+        self.assertEqual(result.peak_imbalance, expected[0][1])
+        ordered = sorted(devices, key=lambda d: d.code)
+        self.assertEqual(
+            tuple(result.assignment[d.code] for d in ordered), expected[3]
+        )
 
 
 if __name__ == "__main__":

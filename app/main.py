@@ -24,6 +24,10 @@ from .schemas import (
     PhaseFaultRehearsalResult,
     RobustRehearsalRequest,
     RobustRehearsalResult,
+    ShiftAssignmentItem,
+    ShiftLoads,
+    ShiftPlanRequest,
+    ShiftPlanResult,
     StartupPlanRequest,
     StartupPlanResult,
     StartupStep,
@@ -33,12 +37,14 @@ from .solver import (
     Device,
     FaultRehearsalDevice,
     RobustDevice,
+    ShiftDevice,
     StartupDevice,
     solve,
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
     solve_robust,
+    solve_shift_plan,
     solve_startup_plan,
 )
 
@@ -72,6 +78,14 @@ _MESSAGE_ADDITION_FEASIBLE = (
 _MESSAGE_ADDITION_INFEASIBLE = (
     "无可行分配：保持原容量不变时，不存在新旧设备全部接入且各相不超容量的方案"
 )
+_MESSAGE_SHIFT_FEASIBLE = (
+    "预演成功：已在最小化两时段总负载较大值、再最小化两时段三相负载差较大值的"
+    "目标下，找到各设备的运行时段与接入相位安排"
+)
+_MESSAGE_SHIFT_INFEASIBLE = (
+    "无可行安排：不存在每台设备均选择允许时段与允许相位、"
+    "且两时段各相负载均不超容量的方案"
+)
 
 
 @asynccontextmanager
@@ -100,6 +114,12 @@ app = FastAPI(
         "（沿用编号、功率与允许相位规则，新旧合计不超过 12 台且编号不重复），"
         "保持原容量不变，求解全部设备接入且各相不超容量、原设备改相台数最少、"
         "负载差最小、相位序列字典序最小的方案（仅预演，不修改历史记录）。"
+        "另提供双时段错峰接入预演：提交 1~8 台设备（唯一编号、正整数功率、"
+        "允许相位与允许运行时段：早 / 晚）及时段共用的 A/B/C 各相容量，"
+        "每台设备恰选一个允许时段与一个允许相位，两时段各相负载均不得超容量；"
+        "先最小化两时段总负载的较大值，再最小化两时段三相负载差的较大值，"
+        "同值时取按设备编号排序后的（时段、相位）序列字典序最小者"
+        "（仅预演，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -593,5 +613,77 @@ def device_addition_plan(
             _MESSAGE_ADDITION_FEASIBLE
             if result.feasible
             else _MESSAGE_ADDITION_INFEASIBLE
+        ),
+    )
+
+
+@app.post(
+    "/api/v1/shift-plans",
+    response_model=ShiftPlanResult,
+    tags=["rehearsals"],
+)
+def shift_plan(payload: ShiftPlanRequest) -> ShiftPlanResult:
+    """双时段错峰接入预演：为每台设备规划运行时段（早 / 晚）与接入相位。
+
+    提交 1~8 台设备的唯一编号、正整数功率、允许相位与允许运行时段（早、晚），
+    以及两时段共用的 A/B/C 各相容量。每台设备恰选一个允许时段和一个允许相位，
+    早、晚两时段各相负载均不得超过容量。优化目标依次为：
+
+    1. 最小化两时段总负载（该时段三相负载之和）的较大值（``peak_total``）；
+    2. 再最小化两时段「三相负载最大值与最小值之差」的较大值
+       （``peak_imbalance``）；
+    3. 仍同值时，取按设备编号排序后的（时段、相位）序列字典序最小者
+       （早＜晚，A＜B＜C）。
+
+    返回每台设备的时段与相位安排、早 / 晚两时段各自的三相负载及两个峰值；
+    无可行安排时返回 ``feasible=false``。仅做预演，不写入历史计算记录。
+    """
+    devices = [
+        ShiftDevice(
+            code=d.id,
+            power=d.power,
+            allowed_phases=tuple(d.allowed_phases),
+            allowed_shifts=tuple(d.allowed_shifts),
+        )
+        for d in payload.devices
+    ]
+    capacities = {
+        "A": payload.capacities.A,
+        "B": payload.capacities.B,
+        "C": payload.capacities.C,
+    }
+    result = solve_shift_plan(devices, capacities)
+
+    assignments = (
+        [
+            ShiftAssignmentItem(
+                device_id=code,
+                shift=result.assignment[code][0],
+                phase=result.assignment[code][1],
+            )
+            for code in sorted(result.assignment)
+        ]
+        if result.feasible
+        else []
+    )
+    loads = (
+        ShiftLoads(
+            morning=Loads(**result.loads["morning"]),
+            evening=Loads(**result.loads["evening"]),
+        )
+        if result.feasible
+        else None
+    )
+    return ShiftPlanResult(
+        capacities=Loads(**capacities),
+        feasible=result.feasible,
+        peak_total=result.peak_total,
+        peak_imbalance=result.peak_imbalance,
+        loads=loads,
+        assignments=assignments,
+        message=(
+            _MESSAGE_SHIFT_FEASIBLE
+            if result.feasible
+            else _MESSAGE_SHIFT_INFEASIBLE
         ),
     )

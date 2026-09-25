@@ -333,3 +333,90 @@ class DeviceAdditionPlanResult(BaseModel):
         ..., description="改相的原设备清单（按设备编号排序）；无解时为空"
     )
     message: str
+
+
+# ---------------------------------------------------------------------------
+# 双时段错峰接入预演
+# ---------------------------------------------------------------------------
+
+Shift = Literal["morning", "evening"]
+
+_SHIFT_ORDER = {"morning": 0, "evening": 1}
+
+
+class ShiftDeviceIn(BaseModel):
+    """双时段错峰接入的单台设备。"""
+
+    id: str = Field(..., min_length=1, max_length=64, description="设备唯一编号")
+    power: int = Field(..., gt=0, description="设备功率（正整数）")
+    allowed_phases: list[Phase] = Field(
+        ..., min_length=1, description="可接入相位集合，非空，元素取自 A/B/C"
+    )
+    allowed_shifts: list[Shift] = Field(
+        ..., min_length=1, description="允许运行时段集合，非空，元素取自 morning/evening"
+    )
+
+    @field_validator("allowed_phases")
+    @classmethod
+    def _dedupe_and_order_phases(cls, value: list[str]) -> list[str]:
+        """去重并按 A/B/C 固定顺序排列。"""
+        return sorted(set(value), key=_PHASE_ORDER.__getitem__)
+
+    @field_validator("allowed_shifts")
+    @classmethod
+    def _dedupe_and_order_shifts(cls, value: list[str]) -> list[str]:
+        """去重并按 morning/evening 固定顺序排列。"""
+        return sorted(set(value), key=_SHIFT_ORDER.__getitem__)
+
+
+class ShiftPlanRequest(BaseModel):
+    """双时段错峰接入预演请求体（仅预演，不写入历史计算记录）。"""
+
+    capacities: Capacities = Field(
+        ..., description="早 / 晚两时段共用的 A/B/C 各相容量"
+    )
+    devices: list[ShiftDeviceIn] = Field(
+        ..., min_length=1, max_length=8, description="设备列表，1~8 台"
+    )
+
+    @model_validator(mode="after")
+    def _unique_device_ids(self) -> "ShiftPlanRequest":
+        ids = [d.id for d in self.devices]
+        if len(ids) != len(set(ids)):
+            raise ValueError("设备编号必须唯一")
+        return self
+
+
+class ShiftLoads(BaseModel):
+    """早 / 晚两时段各自的 A/B/C 三相负载。"""
+
+    morning: Loads
+    evening: Loads
+
+
+class ShiftAssignmentItem(BaseModel):
+    """单台设备的双时段安排：运行时段与接入相位。"""
+
+    device_id: str
+    shift: Shift
+    phase: Phase
+
+
+class ShiftPlanResult(BaseModel):
+    """双时段错峰接入预演结果（仅预演，不写入历史计算记录）。"""
+
+    capacities: Loads = Field(..., description="两时段共用的各相容量（回显请求输入）")
+    feasible: bool = Field(..., description="是否存在满足容量约束的时段 + 相位安排")
+    peak_total: Optional[int] = Field(
+        None, description="两时段三相总负载的较大值（首要优化目标）"
+    )
+    peak_imbalance: Optional[int] = Field(
+        None, description="两时段「三相负载最大值与最小值之差」的较大值（次要优化目标）"
+    )
+    loads: Optional[ShiftLoads] = Field(
+        None, description="早 / 晚两时段各自的三相负载；无解时为 null"
+    )
+    assignments: list[ShiftAssignmentItem] = Field(
+        ..., description="设备安排（按设备编号排序）；无解时为空"
+    )
+    message: str
